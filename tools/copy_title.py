@@ -1,6 +1,8 @@
 # Robot penyalin judul untuk GitHub Actions (berjalan di runner, token repo sendiri).
 # v2 (29 Okt 2026): header Referer/UA pada unduh langsung, coba-ulang per segmen,
 # rotasi kandidat provider antar-percobaan, playlist pendek ditolak saat resolusi, pekerja unduh 10.
+# v3 (29 Okt 2026): unggah per episode + resume dari isi repo — progres tidak hangus
+# bila run berhenti di tengah (kasus Vinland: 13 ep hilang karena gagal di ep14).
 # Masukan lewat env: WID, SLUG_ID, ANILIST_ID, TOTAL_EPS, TITLE_NAME, GH_TOKEN, GH_REPO.
 import base64, hashlib, json, os, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -193,41 +195,54 @@ def download_episode(slug_id, num, outdir):
     log(f'  ep{num}: {len(groups)} potongan besar, {sum(chunk_durs):.0f} dtk OK')
     return True
 
+def existing_eps():
+    """Episode yang sudah terunggah di repo (untuk resume): nama dir ep<n> di <WID>/."""
+    s, r = gh('GET', f'/repos/{REPO}/contents/{WID}')
+    if s != 200 or not isinstance(r, list): return set()
+    out = set()
+    for it in r:
+        nm = it.get('name', '')
+        if it.get('type') == 'dir' and nm.startswith('ep') and nm[2:].isdigit(): out.add(int(nm[2:]))
+    return out
+
+def upload_episode(ep, edir, parent):
+    """Unggah satu episode sebagai satu commit; kembalikan sha commit baru."""
+    names = sorted(os.listdir(edir))
+    def up(fn):
+        data = open(os.path.join(edir, fn), 'rb').read()
+        want = blob_sha(data)
+        s2, b = gh('POST', f'/repos/{REPO}/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+        return {'path': f'{WID}/ep{ep}/{fn}', 'mode': '100644', 'type': 'blob', 'sha': b.get('sha') or want}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        items = list(ex.map(up, names))
+    s, pc = gh('GET', f'/repos/{REPO}/git/commits/{parent}'); base_tree = pc['tree']['sha']
+    s, tree = gh('POST', f'/repos/{REPO}/git/trees', {'base_tree': base_tree, 'tree': items})
+    if s not in (200, 201): log('tree gagal', s); sys.exit(4)
+    s, commit = gh('POST', f'/repos/{REPO}/git/commits', {
+        'message': f'{WID} episode {ep} (segmen HLS)', 'tree': tree['sha'], 'parents': [parent]})
+    if s not in (200, 201): log('commit gagal', s); sys.exit(4)
+    parent = commit['sha']
+    s, upd = gh('PATCH', f'/repos/{REPO}/git/refs/heads/main', {'sha': parent})
+    if s != 200: log('ref gagal', s); sys.exit(4)
+    log(f'  ep{ep} commit ok ({parent[:7]})')
+    return parent
+
 def main():
     os.makedirs(OUT, exist_ok=True)
+    have = existing_eps()
+    if have: log(f'resume: {len(have)} episode sudah ada di repo, dilanjutkan')
+    s, ref = gh('GET', f'/repos/{REPO}/git/ref/heads/main')
+    parent = ref['object']['sha']
     for ep in range(1, TOTAL + 1):
+        if ep in have: continue
         edir = os.path.join(OUT, f'ep{ep}')
-        if os.path.exists(os.path.join(edir, 'playlist.m3u8')): continue
         ok = False
         for attempt in range(6):
             if download_episode(SLUG_ID, ep, edir): ok = True; break
             log(f'  ep{ep}: unduh belum utuh (percobaan {attempt + 1}/6)'); time.sleep(10)
         if not ok:
-            log(f'EP{ep} GAGAL — berhenti'); sys.exit(3)
-    # Unggah per episode lewat Git Data API (token repo sendiri).
-    s, ref = gh('GET', f'/repos/{REPO}/git/ref/heads/main')
-    parent = ref['object']['sha']
-    for ep in range(1, TOTAL + 1):
-        d = os.path.join(OUT, f'ep{ep}')
-        names = sorted(os.listdir(d))
-        items = []
-        def up(fn):
-            data = open(os.path.join(d, fn), 'rb').read()
-            want = blob_sha(data)
-            s2, b = gh('POST', f'/repos/{REPO}/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
-            return {'path': f'{WID}/ep{ep}/{fn}', 'mode': '100644', 'type': 'blob', 'sha': b.get('sha') or want}
-        with ThreadPoolExecutor(max_workers=12) as ex:
-            items = list(ex.map(up, names))
-        s, pc = gh('GET', f'/repos/{REPO}/git/commits/{parent}'); base_tree = pc['tree']['sha']
-        s, tree = gh('POST', f'/repos/{REPO}/git/trees', {'base_tree': base_tree, 'tree': items})
-        if s not in (200, 201): log('tree gagal', s); sys.exit(4)
-        s, commit = gh('POST', f'/repos/{REPO}/git/commits', {
-            'message': f'{WID} episode {ep} (segmen HLS)', 'tree': tree['sha'], 'parents': [parent]})
-        if s not in (200, 201): log('commit gagal', s); sys.exit(4)
-        parent = commit['sha']
-        s, upd = gh('PATCH', f'/repos/{REPO}/git/refs/heads/main', {'sha': parent})
-        if s != 200: log('ref gagal', s); sys.exit(4)
-        log(f'  ep{ep} commit ok ({parent[:7]})')
+            log(f'EP{ep} GAGAL — berhenti (episode yang sudah selesai aman tersimpan di repo)'); sys.exit(3)
+        parent = upload_episode(ep, edir, parent)
     pin = parent
     manifest = {'wid': WID, 'anilistId': ANILIST, 'name': NAME, 'totalEpisodes': TOTAL,
                 'repo': REPO, 'pin': pin}
