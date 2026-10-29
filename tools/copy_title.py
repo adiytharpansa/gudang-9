@@ -1,4 +1,6 @@
 # Robot penyalin judul untuk GitHub Actions (berjalan di runner, token repo sendiri).
+# v2 (29 Okt 2026): header Referer/UA pada unduh langsung, coba-ulang per segmen,
+# rotasi kandidat provider antar-percobaan, playlist pendek ditolak saat resolusi, pekerja unduh 10.
 # Masukan lewat env: WID, SLUG_ID, ANILIST_ID, TOTAL_EPS, TITLE_NAME, GH_TOKEN, GH_REPO.
 import base64, hashlib, json, os, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -37,9 +39,12 @@ def gh(m, p, payload=None, tries=6):
 
 def blob_sha(data): return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
 
-def curl_bytes(url, tries=4, timeout=120):
+def curl_bytes(url, tries=4, timeout=120, ref=None):
+    cmd = ['curl', '-s', '-f', '--max-time', str(timeout), '-A', UA]
+    if ref: cmd += ['-H', 'Referer: ' + ref]
+    cmd.append(url)
     for t in range(tries):
-        r = subprocess.run(['curl', '-s', '-f', '--max-time', str(timeout), url], capture_output=True)
+        r = subprocess.run(cmd, capture_output=True)
         if r.returncode == 0 and r.stdout: return r.stdout
     return None
 
@@ -83,12 +88,12 @@ def parse_variant(master, stream_url, ref):
 
 def fetch_segment(s_abs, ref):
     if s_abs.startswith(WORKER): return curl_bytes(s_abs, tries=2)
-    data = curl_bytes(s_abs, tries=2)
+    data = curl_bytes(s_abs, tries=2, ref=ref)
     if is_ts(data): return data
     alt = curl_bytes(prox(s_abs, ref))
     return alt if is_ts(alt) else data
 
-def resolve_source(slug_id, num):
+def resolve_source(slug_id, num, skip=0):
     srv = anidap_json(f'https://chad.anidap.lol/rest/api/servers?id={urllib.parse.quote(slug_id)}&epNum={num}')
     if not srv: return None
     provs = sorted(srv.get('subProviders') or [], key=lambda p: 0 if p.get('default') else 1)
@@ -100,6 +105,7 @@ def resolve_source(slug_id, num):
         for x in (s.get('sources') or []):
             if x.get('url'): cands.append((x['url'], ref))
     cands.sort(key=lambda c: 0 if 'nexabloom' in c[0] else 1)
+    cands_ok = []
     for u, ref in cands:
         raw = curl_bytes(prox(u, ref), tries=2)
         if not raw or not raw.decode('utf-8', 'replace').lstrip().startswith('#EXTM3U'):
@@ -108,14 +114,16 @@ def resolve_source(slug_id, num):
         parsed = parse_variant(master, u, ref)
         if not parsed: continue
         pl, pl_base, durs, segs = parsed
+        if 0 < sum(durs) < 600: continue  # playlist pendek (cuplikan), bukan episode utuh
         # Uji segmen pertama & tengah: kandidat hanya diterima bila segmennya
         # benar-benar bisa diambil (playlist saja tidak cukup — kasus AoT).
         ok = True
         for idx in {0, len(segs) // 2}:
             s_abs = resolve_ref(pl_base, segs[idx])
             if not is_ts(fetch_segment(s_abs, ref)): ok = False; break
-        if ok: return (pl, pl_base, durs, segs, ref)
-    return None
+        if ok: cands_ok.append((pl, pl_base, durs, segs, ref))
+    if not cands_ok: return None
+    return cands_ok[skip % len(cands_ok)]
 
 def fetch_playlist(url, ref):
     if url.startswith(WORKER):
@@ -134,7 +142,7 @@ def is_ts(data): return bool(data) and len(data) > 188 and data[0] == 0x47
 def download_episode(slug_id, num, outdir):
     got = None
     for attempt in range(3):
-        got = resolve_source(slug_id, num)
+        got = resolve_source(slug_id, num, skip=attempt)
         if got: break
         log(f'  ep{num}: resolusi kosong (coba {attempt + 1}/3)'); time.sleep(10)
     if not got: return False
@@ -146,11 +154,14 @@ def download_episode(slug_id, num, outdir):
             with open(path, 'rb') as f: head = f.read(1)
             if head == b'\x47': return True
         s_abs = resolve_ref(pl_base, segs[i])
-        data = fetch_segment(s_abs, referer)
-        if not is_ts(data): return False
-        with open(path, 'wb') as f: f.write(data)
-        return True
-    with ThreadPoolExecutor(max_workers=16) as ex:
+        for rnd in range(3):
+            data = fetch_segment(s_abs, referer)
+            if is_ts(data):
+                with open(path, 'wb') as f: f.write(data)
+                return True
+            time.sleep(2 + rnd * 3)
+        return False
+    with ThreadPoolExecutor(max_workers=10) as ex:
         results = list(ex.map(grab, range(len(segs))))
     if not all(results):
         log(f'  ep{num}: segmen gagal {results.count(False)}'); return False
@@ -188,9 +199,9 @@ def main():
         edir = os.path.join(OUT, f'ep{ep}')
         if os.path.exists(os.path.join(edir, 'playlist.m3u8')): continue
         ok = False
-        for attempt in range(4):
+        for attempt in range(6):
             if download_episode(SLUG_ID, ep, edir): ok = True; break
-            log(f'  ep{ep}: unduh belum utuh (percobaan {attempt + 1}/4)'); time.sleep(15)
+            log(f'  ep{ep}: unduh belum utuh (percobaan {attempt + 1}/6)'); time.sleep(10)
         if not ok:
             log(f'EP{ep} GAGAL — berhenti'); sys.exit(3)
     # Unggah per episode lewat Git Data API (token repo sendiri).
