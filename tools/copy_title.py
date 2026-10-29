@@ -3,6 +3,9 @@
 # rotasi kandidat provider antar-percobaan, playlist pendek ditolak saat resolusi, pekerja unduh 10.
 # v3 (29 Okt 2026): unggah per episode + resume dari isi repo — progres tidak hangus
 # bila run berhenti di tengah (kasus Vinland: 13 ep hilang karena gagal di ep14).
+# v4 (29 Okt 2026 malam): ambil playlist LANGSUNG dulu (Referer/UA), proxy Worker hanya
+# cadangan — terbukti resolusi kosong massal disebabkan playlist yang wajib lewat proxy
+# Worker padahal kuota Workers mati (429), sementara sumber & segmen bisa langsung.
 # Masukan lewat env: WID, SLUG_ID, ANILIST_ID, TOTAL_EPS, TITLE_NAME, GH_TOKEN, GH_REPO.
 import base64, hashlib, json, os, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -95,6 +98,14 @@ def fetch_segment(s_abs, ref):
     alt = curl_bytes(prox(s_abs, ref))
     return alt if is_ts(alt) else data
 
+
+def fetch_raw_smart(u, ref, tries=2):
+    """Ambil URL sumber langsung dulu (dengan Referer), proxy Worker cadangan.
+    Kembalikan bytes mentah atau None; penelepon memvalidasi isinya."""
+    raw = curl_bytes(u, tries=tries, ref=ref)
+    if raw: return raw
+    return curl_bytes(prox(u, ref), tries=tries)
+
 def resolve_source(slug_id, num, skip=0):
     srv = anidap_json(f'https://chad.anidap.lol/rest/api/servers?id={urllib.parse.quote(slug_id)}&epNum={num}')
     if not srv: return None
@@ -109,7 +120,7 @@ def resolve_source(slug_id, num, skip=0):
     cands.sort(key=lambda c: 0 if 'nexabloom' in c[0] else 1)
     cands_ok = []
     for u, ref in cands:
-        raw = curl_bytes(prox(u, ref), tries=2)
+        raw = fetch_raw_smart(u, ref, tries=2)
         if not raw or not raw.decode('utf-8', 'replace').lstrip().startswith('#EXTM3U'):
             continue
         master = raw.decode('utf-8', 'replace')
@@ -131,7 +142,7 @@ def fetch_playlist(url, ref):
     if url.startswith(WORKER):
         raw = curl_bytes(url)
         return (raw.decode('utf-8', 'replace') if raw else None), url
-    raw = curl_bytes(prox(url, ref))
+    raw = fetch_raw_smart(url, ref)
     return (raw.decode('utf-8', 'replace') if raw else None), url
 
 def resolve_ref(base_url, line):
